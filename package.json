@@ -1,0 +1,19 @@
+{
+  "name": "entry-browser-server",
+  "version": "1.0.0",
+  "description": "엔트리 브라우저 작품이 요청한 웹 페이지를 가져와 실시간 변수로 돌려주는 서버",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": "22.x"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "css-tree": "^3.2.1",
+    "socket.io-client": "^2.5.0",
+    "ws": "^7.5.10"
+  }
+}
