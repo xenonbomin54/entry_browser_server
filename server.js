@@ -34,6 +34,7 @@ const PROJECT_ID = process.env.PROJECT_ID;
 const ALLOW_HOSTS = (process.env.ALLOW_HOSTS || "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
 const CHUNK_SIZE = Number(process.env.CHUNK_SIZE || 2500);
 const NCHUNK = Math.max(1, Math.min(12, Number(process.env.MAX_CHUNKS || 12)));   // 응답 하나에 쓸 조각 수 (작게 하면 엔트리에 주는 부담이 준다)
+const TOTAL_BUDGET = Number(process.env.TOTAL_BUDGET || 45000);                    // 한 페이지 전체(여러 부분으로 나눠 보냄)에 쓸 글자 수
 const WRITE_GAP = Number(process.env.WRITE_GAP || 150);                           // 조각을 쓰는 간격(ms)
 let usedChunks = 12;                                                               // 내용이 남아 있을 수 있는 조각 수
 const UA = "Mozilla/5.0 (compatible; EntryBrowserBot/1.0)";
@@ -45,7 +46,7 @@ const state = { connected: false, lastError: "", served: 0, startedAt: new Date(
 let socket = null;
 let vars = {};          // 이름 -> { _id, id }
 const queue = [];
-let working = false;
+let active = 0;                // 지금 처리 중인 요청 수
 let lastReqValue = null;      // 마지막으로 본 REQ 값 (끊긴 사이에 온 요청을 찾는 데 쓴다)
 const lastSeen = new Map();   // 세션별 최근 요청 시각
 
@@ -203,7 +204,7 @@ async function connect() {
 }
 // 연결이 조용히 죽는 경우에 대비해 주기적으로 살펴본다
 function watchdog() {
-    if (working || queue.length || connecting || reconnectTimer) return;
+    if (active || queue.length || connecting || reconnectTimer) return;
     const dead = !socket || !socket.connected;
     const old = Date.now() - connectedAt > 12 * 60000;
     if (dead || old) { log(dead ? "연결이 죽어 있어 다시 연결" : "연결을 새로 고침"); connect(); }
@@ -225,43 +226,185 @@ function onAction(msg) {
     lastReqValue = String(msg.value);
     const m = /^(\d{1,9})\|(\d{1,9})\|([\s\S]{1,2000})$/.exec(String(msg.value));
     if (!m) return;
-    const now = Date.now();
-    if (now - (lastSeen.get(m[1]) || 0) < 800) return;      // 같은 사람의 연타 무시
-    lastSeen.set(m[1], now);
-    if (lastSeen.size > 5000) lastSeen.clear();
-    if (queue.length >= 20) return;
-    log("요청 받음", m[3].trim().slice(0, 80));
-    queue.push({ sid: m[1], seq: m[2], url: m[3].trim() });
+    let rest = m[3], nick = "";
+    const um = /^U:([^|]{0,40})\|([\s\S]+)$/.exec(rest);
+    if (um) { nick = um[1].trim(); rest = um[2]; }
+    let reqUrl = rest.trim(), part = 1;
+    const pm = /^@p(\d{1,3})@([\s\S]+)$/.exec(reqUrl);
+    if (pm) { part = Math.max(1, Number(pm[1])); reqUrl = pm[2].trim(); }
+    log("요청 받음", reqUrl.slice(0, 80), part > 1 ? "(부분 " + part + ")" : "", nick ? "· " + nick : "· (닉네임 없음)");
+    const job = { sid: m[1], seq: m[2], url: reqUrl, part, nick };
+    // 같은 사람이 기다리는 요청이 있으면 새 요청으로 바꾼다 (연타·다시 받기)
+    const same = queue.findIndex((j) => j.sid === job.sid);
+    if (same >= 0) queue[same] = job;
+    else { if (queue.length >= 30) return; queue.push(job); }
     pump();
 }
-async function pump() {
-    if (working) return;
-    working = true;
-    while (queue.length) {
+const PARALLEL = Math.max(1, Number(process.env.PARALLEL || 3));   // 동시에 가져올 페이지 수
+const RES_GAP = Number(process.env.RES_GAP || 1200);                 // 응답과 응답 사이 간격(ms): 받는 쪽이 조각을 다 읽을 시간
+let pausedForTest = false;
+function pump() {
+    if (pausedForTest) return;
+    while (active < PARALLEL && queue.length) {
         const job = queue.shift();
-        state.lastRequestAt = new Date().toISOString();
-        let page;
-        try {
-            page = await loadPage(job.url);
-        } catch (e) {
-            page = { title: "오류", html: errorPage(job.url, String(e.message || e)) };
-        }
-        await respond(job, page);
-        state.served++;
-        await new Promise((r) => setTimeout(r, 700));        // 받는 쪽이 조각을 읽을 시간을 준다
+        active++;
+        handleJob(job).catch((e) => log("처리 실패:", e && e.message)).finally(() => { active--; pump(); });
     }
-    working = false;
+}
+async function handleJob(job) {
+    state.lastRequestAt = new Date().toISOString();
+    let page;
+    const q = await checkQuota(job);
+    if (!q.ok) page = q.page;
+    else {
+        try { page = await loadPage(job.url); }
+        catch (e) { page = { title: "오류", html: errorPage(job.url, String(e.message || e)) }; }
+        page = partOf(page, job.part || 1);
+    }
+    await sendInTurn(job, page, q.left);
+    state.served++;
+}
+// 응답 칸(C1~C12)은 모두가 같이 쓰므로, 응답은 한 번에 하나씩 보내고 사이에 간격을 둔다
+let sendChain = Promise.resolve();
+function sendInTurn(job, page, left) {
+    const p = sendChain.then(async () => { await respond(job, page, left); await sleep(RES_GAP); });
+    sendChain = p.catch(() => {});
+    return p;
+}
+
+// ------------------------------------------------------------------ 사용량 제한
+const DAILY_LIMIT = Number(process.env.DAILY_LIMIT || 10);       // 한 사람이 하루에 열 수 있는 페이지 수
+const LIKE_BONUS = Number(process.env.LIKE_BONUS || 5);          // 작품에 좋아요를 누르면 더해 주는 수
+const UNLIMITED = new Set((process.env.UNLIMITED || "").split(",").map((x) => x.trim()).filter(Boolean));
+const usage = new Map();      // 닉네임 -> { day, urls: Set }  (서버를 다시 켜면 처음부터 센다)
+function kstDay() { return new Date(Date.now() + 9 * 3600000).toISOString().slice(0, 10); }
+let likeSet = new Set(), likeAt = 0, likeLoading = null;
+let anonAuth = null, anonAt = 0;
+async function gqlHeaders() {
+    if (accCache) return { "csrf-token": accCache.csrfToken, "x-token": accCache.xToken, cookie: accCache.cookie };
+    if (!anonAuth || Date.now() - anonAt > 3600000) {
+        const first = await fetch("https://playentry.org/");
+        anonAuth = { "csrf-token": nextData(await first.text()).props.initialProps.csrfToken, cookie: "_csrf=" + pickCookie(first, "_csrf") + ";" };
+        anonAt = Date.now();
+    }
+    return anonAuth;
+}
+async function loadLikers() {
+    const set = new Set();
+    const auth = await gqlHeaders();
+    for (let start = 0, pages = 0; start < 2000 && pages < 40; pages++) {
+        const res = await fetch("https://playentry.org/graphql/LIKE_LIST", {
+            method: "POST", signal: AbortSignal.timeout(8000),
+            headers: Object.assign({ "Content-Type": "application/json" }, auth),
+            body: JSON.stringify({
+                query: "query LIKE_LIST($target: String, $pageParam: PageParam){ likeList(target: $target, pageParam: $pageParam) { total list { user { nickname } } } }",
+                variables: { target: PROJECT_ID, pageParam: { display: 100, start } },
+            }),
+        });
+        const j = await res.json();
+        const ls = (j.data && j.data.likeList && j.data.likeList.list) || [];
+        ls.forEach((x) => x && x.user && x.user.nickname && set.add(x.user.nickname));
+        const total = (j.data && j.data.likeList && j.data.likeList.total) || 0;
+        if (!ls.length || set.size >= total) break;
+        start += ls.length;
+    }
+    return set;
+}
+async function likers(maxAgeMs) {
+    if (Date.now() - likeAt < maxAgeMs) return likeSet;
+    if (!likeLoading) likeLoading = loadLikers().then((s) => { likeSet = s; likeAt = Date.now(); log("좋아요 목록", s.size + "명"); })
+        .catch((e) => log("좋아요 목록을 못 가져옴:", e && e.message)).finally(() => { likeLoading = null; });
+    await likeLoading;
+    return likeSet;
+}
+function simplePage(title, body) {
+    return { title, html: `<html><head><title>${title}</title><style>body{margin:0;background:#f8f9fa}.card{width:460px;margin:64px auto 0;background:#ffffff;border:1px solid #e3e5e8;padding:26px 34px}h2{margin:0 0 12px;font-size:22px;color:#202124}p{margin:8px 0;font-size:14px;color:#5f6368}b{color:#202124}a{color:#1a73e8}</style></head><body><div class="card"><h2>${title}</h2>${body}<p><a href="about:home">홈으로 돌아가기</a></p></div></body></html>` };
+}
+async function checkQuota(job) {
+    if (!job.nick) return { ok: false, left: "", page: simplePage("로그인이 필요해요", "<p>엔트리에 로그인한 사람만 바깥 사이트를 열 수 있어요.</p><p>로그인한 뒤 작품 페이지를 새로고침해 주세요.</p>") };
+    if (UNLIMITED.has(job.nick)) return { ok: true, left: "" };
+    const day = kstDay();
+    let u = usage.get(job.nick);
+    if (!u || u.day !== day) { u = { day, urls: new Set() }; usage.set(job.nick, u); }
+    if (usage.size > 20000) usage.clear();
+    let liked = (await likers(5 * 60000)).has(job.nick);
+    let limit = DAILY_LIMIT + (liked ? LIKE_BONUS : 0);
+    // 이미 오늘 연 페이지(다시 불러오기, 뒤로 가기, 이어 받기)는 다시 세지 않는다
+    if (u.urls.has(job.url)) return { ok: true, left: Math.max(0, limit - u.urls.size) };
+    if (u.urls.size >= limit && !liked) {
+        liked = (await likers(10000)).has(job.nick);           // 방금 좋아요를 눌렀을 수 있다
+        limit = DAILY_LIMIT + (liked ? LIKE_BONUS : 0);
+    }
+    if (u.urls.size >= limit) {
+        log("사용량 초과", job.nick, u.urls.size + "/" + limit);
+        const more = liked ? "" : `<p>작품에 <b>좋아요</b>를 누르면 오늘 <b>${LIKE_BONUS}번</b> 더 열 수 있어요. 좋아요를 누른 뒤 다시 시도해 주세요.</p>`;
+        return { ok: false, left: 0, page: simplePage("오늘 열 수 있는 페이지를 다 썼어요", `<p>한 사람이 하루에 <b>${limit}개</b>의 페이지를 열 수 있어요. 이미 연 페이지는 다시 열어도 세지 않아요.</p>${more}<p>한국 시간 밤 12시에 다시 채워져요.</p>`) };
+    }
+    u.urls.add(job.url);
+    return { ok: true, left: limit - u.urls.size };
+}
+// 긴 그리기 목록을 세로 위치 기준으로 여러 부분으로 나눈다. 작품은 스크롤이 끝에 닿으면 다음 부분을 요청한다.
+// 엔트리 변수에 한 번에 큰 값을 쓰지 않으려는 것이다.
+function splitDL(dl, cap) {
+    const lines = dl.split("\n");
+    const head = (lines[1] || "P|0|ffffff|0").split("|");
+    const docH = Number(head[1]) || 0, bg = head[2] || "ffffff", cut = head[3] === "1" ? 1 : 0;
+    const links = [], items = [];
+    for (let i = 2; i < lines.length; i++) {
+        const ln = lines[i];
+        if (ln.startsWith("L|")) links.push(ln.slice(2));
+        else if (ln.startsWith("R|") || ln.startsWith("T|") || ln.startsWith("I|")) {
+            const f = ln.split("|");
+            items.push({ ln, y: Number(f[2]) || 0, li: ln[0] === "T" ? Number(f[7]) || 0 : 0, ord: items.length });
+        }
+    }
+    const byY = items.slice().sort((a, b) => a.y - b.y || a.ord - b.ord);
+    const parts = []; let cur = [], size = 60, used = new Set();
+    const flush = (yEnd) => { parts.push({ items: cur, yEnd }); cur = []; size = 60; used = new Set(); };
+    for (const it of byY) {
+        let cost = it.ln.length + 1;
+        if (it.li && !used.has(it.li)) cost += (links[it.li - 1] || "").length + 3;
+        if (cur.length && size + cost > cap) flush(it.y);
+        if (it.li) used.add(it.li);
+        cur.push(it); size += cost;
+    }
+    if (cur.length || !parts.length) flush(docH);
+    return parts.map((p, k) => {
+        const last = k === parts.length - 1;
+        const remap = new Map(), outL = [];
+        const body = p.items.sort((a, b) => a.ord - b.ord).map((it) => {
+            if (!it.li) return it.ln;
+            if (!remap.has(it.li)) { outL.push("L|" + (links[it.li - 1] || "")); remap.set(it.li, outL.length); }
+            const f = it.ln.split("|"); f[7] = remap.get(it.li);
+            return f.join("|");
+        });
+        // 마지막이 아니면 문서 높이를 "여기까지"로 알려서 그 아래로는 다음 부분을 받은 뒤에 내려가게 한다
+        const h = last ? docH : Math.max(1, Math.round(p.yEnd));
+        return ["@DL1", `P|${h}|${bg}|${last ? cut : 0}|${last ? 0 : 1}`].concat(outL, body).join("\n");
+    });
+}
+function partOf(page, part) {
+    if (!page || typeof page.html !== "string" || !page.html.startsWith("@DL1")) {
+        if (part > 1) return { title: page && page.title, html: "@DL1\nP|0|ffffff|0|0" };   // 그리기 목록이 아니면 이어 줄 것이 없다
+        return page;
+    }
+    if (!page.parts) page.parts = splitDL(page.html, CHUNK_SIZE * NCHUNK - 150);
+    const html = page.parts[part - 1] || "@DL1\nP|0|ffffff|0|0";
+    if (page.parts.length > 1) log("부분", part + "/" + page.parts.length, "글자", html.length);
+    return { title: page.title, html };
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function respond(job, page) {
+async function respond(job, page, left) {
     let html = page.html;
     const cap = CHUNK_SIZE * NCHUNK;
     if (html.length > cap) html = html.startsWith("@DL1") ? html.slice(0, html.lastIndexOf("\n", cap)) : html.slice(0, cap - 60) + "<p><i>… (잘림)</i></p>";
     const n = Math.max(1, Math.ceil(html.length / CHUNK_SIZE));
     // 한꺼번에 쏟아붓지 않고 간격을 두고 쓴다
-    for (let i = 0; i < n; i++) { setVar("C" + (i + 1), html.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE)); await sleep(WRITE_GAP); }
-    const title = String(page.title || "").replace(/\|/g, " ").slice(0, 60);
-    setVar("RES", `${job.sid}|${job.seq}|${n}|${title}`);
+    // 조각마다 요청 번호를 붙여서, 받는 쪽이 남의 응답을 섞어 읽지 않게 한다
+    const tag = `${job.sid}|${job.seq}|`;
+    for (let i = 0; i < n; i++) { setVar("C" + (i + 1), tag + html.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE)); await sleep(WRITE_GAP); }
+    const title = String(page.title || "").replace(/[|\n]/g, " ").slice(0, 60);
+    setVar("RES", `${job.sid}|${job.seq}|${n}|${title}|${left === undefined ? "" : left}`);
     log("응답", job.url.slice(0, 80), "조각", n, "글자", html.length);
     // 이번에 안 쓴 조각에 예전 큰 내용이 남아 있으면 비운다 (엔트리에 큰 값이 쌓여 있지 않게)
     for (let i = n; i < usedChunks; i++) { await sleep(WRITE_GAP); setVar("C" + (i + 1), "-"); }
@@ -296,10 +439,15 @@ const CACHE_MS = 10 * 60000;
 const noScriptHosts = new Set();  // 스크립트 주입이 막힌 사이트 (CSP 등)
 const EXTRACT_SRC = fs.readFileSync(path.join(__dirname, "extract.js"), "utf8");
 
+const inflight = new Map();       // 지금 가져오는 중인 주소 -> Promise (같은 주소를 동시에 두 번 가져오지 않게)
 async function loadPage(u) {
     const hit = pageCache.get(u);
     if (hit && Date.now() - hit.at < CACHE_MS) { log("캐시 사용", u.slice(0, 80)); return hit.page; }
-    const page = await loadPageFresh(u);
+    if (inflight.has(u)) return inflight.get(u);
+    const p = loadPageFresh(u);
+    inflight.set(u, p);
+    let page;
+    try { page = await p; } finally { inflight.delete(u); }
     pageCache.set(u, { page, at: Date.now() });
     if (pageCache.size > 150) pageCache.delete(pageCache.keys().next().value);
     return page;
@@ -333,9 +481,13 @@ async function fetchDirect(url) {
 async function loadPageFresh(u) {
     let url = await checkUrl(u);
     const cap = CHUNK_SIZE * NCHUNK - 400;
+    // 작품은 30초까지만 기다린다. 전체를 DEADLINE 안에 끝내고, 늦어지는 단계는 건너뛰어 더 단순한 결과라도 보낸다.
+    const t0 = Date.now(), DEADLINE = Number(process.env.DEADLINE_MS || 20000);
+    const left = () => DEADLINE - (Date.now() - t0);
+    const within = (p, ms) => Promise.race([p, new Promise((r) => setTimeout(() => r(undefined), Math.max(0, ms)))]);
     let direct = null, directErr = null;
     // 직접 가져오기와 렌더링 서비스를 동시에 시작한다 (작품이 기다리는 시간 안에 끝내려고)
-    const renderedP = renderedPage(url.href, cap).catch(() => null);
+    const renderedP = renderedPage(url.href, TOTAL_BUDGET).catch(() => null);
     try { direct = await fetchDirect(url); } catch (e) { directErr = e; }
     if (direct && /text\/plain/.test(direct.type)) {
         return { title: url.hostname, html: "<pre>" + direct.text.slice(0, 20000).replace(/&/g, "&amp;").replace(/</g, "&lt;") + "</pre>" };
@@ -343,14 +495,16 @@ async function loadPageFresh(u) {
     if (directErr && /웹 페이지가 아니에요/.test(directErr.message)) throw directErr;
     if (direct) url = direct.url;
     // 1순위: 진짜 브라우저가 그린 결과(그리기 목록)
-    const r = await renderedP;
+    let r = await within(renderedP, left() - 4000);
+    if (r === undefined) { log("렌더링이 늦어져 건너뜀", url.href.slice(0, 80)); r = null; }
     if (r && r.dl) return { title: r.title, html: r.dl, mode: "paint" };
     // 2순위: 엔트리가 직접 해석할 HTML (렌더링된 HTML 이 있으면 그걸로)
     const text = r && r.html ? r.html : direct ? direct.text : null;
     if (!text) throw directErr || new Error("페이지를 가져오지 못했어요.");
-    if (USE_CSS) {
+    if (USE_CSS && left() > 5000) {
         try {
-            const sheets = await collectSheets(text, url.href);
+            const sheets = await within(collectSheets(text, url.href), left() - 2500);
+            if (sheets === undefined) throw new Error("스타일을 가져오는 데 시간이 너무 걸림");
             const page = styledSimplify(text, url.href, sheets, { maxChars: cap });
             log("CSS", "시트", sheets.length, "규칙", page.rules, "클래스", page.classes, "노드", page.nodes, "영역", page.root, page.timedOut ? "(시간 초과로 일부만)" : "");
             return page;
@@ -405,10 +559,11 @@ async function renderedPage(pageUrl, cap) {
 async function cfContent(body) {
     const now = Date.now();
     if (now < cfPausedUntil) return null;
-    const wait = cfLastCall + 10500 - now;
-    if (wait > 4000) return null;                       // 너무 오래 기다려야 하면 이번엔 건너뛴다
-    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-    cfLastCall = Date.now();
+    // 여러 요청이 동시에 와도 10.5초 간격을 지키도록, 기다리기 전에 차례를 먼저 잡는다
+    const slot = Math.max(now, cfLastCall + 10500);
+    if (slot - now > 4000) return null;                 // 너무 오래 기다려야 하면 이번엔 건너뛴다
+    cfLastCall = slot;
+    if (slot > now) await new Promise((r) => setTimeout(r, slot - now));
     try {
         const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/browser-rendering/content`, {
             method: "POST", signal: AbortSignal.timeout(19000),
@@ -496,7 +651,7 @@ if (require.main === module) {
     http.createServer((req, res) => {
         res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
         res.end(JSON.stringify(Object.assign({}, state, {
-            socketAlive: !!(socket && socket.connected), queue: queue.length,
+            socketAlive: !!(socket && socket.connected), queue: queue.length, active, usersToday: [...usage.values()].filter((u) => u.day === kstDay()).length, likes: likeSet.size,
             connectedSecondsAgo: connectedAt ? Math.round((Date.now() - connectedAt) / 1000) : null,
             now: new Date().toISOString(),
         })));
@@ -511,4 +666,4 @@ if (require.main === module) {
     }
     process.on("unhandledRejection", (e) => log("처리 안 된 오류:", e && e.message));
 }
-module.exports = { loadPage, checkUrl };
+module.exports = { loadPage, checkUrl, splitDL, partOf, checkQuota, likers, usage, respond, onAction, queue, setTest: (o) => { if (o.socket) socket = o.socket; if (o.vars) vars = o.vars; if (o.pause !== undefined) pausedForTest = o.pause; } };
